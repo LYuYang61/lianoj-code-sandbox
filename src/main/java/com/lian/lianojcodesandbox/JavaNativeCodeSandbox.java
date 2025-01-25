@@ -4,10 +4,13 @@ import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.io.resource.Resource;
 import cn.hutool.core.io.resource.ResourceUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.dfa.FoundWord;
+import cn.hutool.dfa.WordTree;
 import com.lian.lianojcodesandbox.model.ExecuteCodeRequest;
 import com.lian.lianojcodesandbox.model.ExecuteCodeResponse;
 import com.lian.lianojcodesandbox.model.ExecuteMessage;
 import com.lian.lianojcodesandbox.model.JudgeInfo;
+import com.lian.lianojcodesandbox.security.DefaultSecurityManager;
 import com.lian.lianojcodesandbox.utils.ProcessUtils;
 
 import java.io.File;
@@ -33,11 +36,23 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
 
     private static final String SECURITY_MANAGER_CLASS_NAME = "MySecurityManager";
 
+    private static final long TIME_OUT = 5000L;
+
+    private static final List<String> blackList = Arrays.asList("Files", "exec");
+
+    private static final WordTree WORD_TREE;
+
+    static {
+        // 初始化字典树
+        WORD_TREE = new WordTree();
+        WORD_TREE.addWords(blackList);
+    }
+
     public static void main(String[] args) {
         JavaNativeCodeSandbox javaNativeCodeSandbox = new JavaNativeCodeSandbox();
         ExecuteCodeRequest executeCodeRequest = new ExecuteCodeRequest();
         executeCodeRequest.setInputList(Arrays.asList("1 2", "2 3"));
-        // String code = ResourceUtil.readStr("testCode/simpleComputeArgs/Main.java", StandardCharsets.UTF_8);
+//        String code = ResourceUtil.readStr("testCode/simpleComputeArgs/Main.java", StandardCharsets.UTF_8);
         String code = ResourceUtil.readStr("testCode/unsafeCode/RunFileError.java", StandardCharsets.UTF_8);
         executeCodeRequest.setCode(code);
         executeCodeRequest.setLanguage("java");
@@ -47,9 +62,18 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
 
     @Override
     public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest) {
+//        System.setSecurityManager(new DefaultSecurityManager());
+
         List<String> inputList = executeCodeRequest.getInputList();
         String code = executeCodeRequest.getCode();
         String language = executeCodeRequest.getLanguage();
+
+        // 校验用户代码中是否包含黑名单中的关键字
+//        FoundWord foundWord = WORD_TREE.match(code);
+//        if (foundWord != null) {
+//            System.out.println("包含禁止词：" + foundWord.getFoundWord());
+//            return null;
+//        }
 
         // 1. 把用户的代码保存为文件
         String userDir = System.getProperty("user.dir");
@@ -77,10 +101,22 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
         // 3. 运行用户的代码，得到输出的结果
         List<ExecuteMessage> executeMessageList = new ArrayList<>();
         for (String inputArgs : inputList) {
-            String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main %s", userCodeParentPath, inputArgs);  // 运行命令
+//             String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main %s", userCodeParentPath, inputArgs);  // 运行命令
+            String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s;%s -Djava.security.manager=%s Main %s",
+                    userCodeParentPath, SECURITY_MANAGER_PATH, SECURITY_MANAGER_CLASS_NAME, inputArgs);  // 运行命令
             try {
-                Process process = Runtime.getRuntime().exec(runCmd);  // 执行运行命令
-                ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(process, "运行");  // 获取运行信息
+                Process runProcess = Runtime.getRuntime().exec(runCmd);  // 执行运行命令
+                // 超时控制
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(TIME_OUT);
+                        System.out.println("超时了，中断");
+                        runProcess.destroy();
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }).start();
+                ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(runProcess, "运行");  // 获取运行信息
                 System.out.println(executeMessage);
                 executeMessageList.add(executeMessage);
             } catch (Exception e) {
