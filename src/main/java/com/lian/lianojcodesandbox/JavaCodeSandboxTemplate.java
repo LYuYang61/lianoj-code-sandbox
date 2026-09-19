@@ -2,6 +2,7 @@ package com.lian.lianojcodesandbox;
 
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.dfa.WordTree;
 import com.lian.lianojcodesandbox.model.ExecuteCodeRequest;
 import com.lian.lianojcodesandbox.model.ExecuteCodeResponse;
 import com.lian.lianojcodesandbox.model.ExecuteMessage;
@@ -12,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
@@ -31,11 +33,66 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
 
     private static final long TIME_OUT = 5000L;
 
+    /**
+     * 危险关键字黑名单（E03 安全第一道闸）：
+     * 提交代码中命中任一关键字即拒绝执行，防止读写宿主文件、执行系统命令、建立网络连接等行为。
+     * 采用 hutool DFA 字典树（WordTree）做多模式匹配，时间复杂度 O(文本长度)，远优于逐词 contains。
+     * <p>定位与取舍：黑名单可被反射/编码/字符串拼接等手段绕过，属于低成本的前置闸门；
+     * 真正的安全兜底是进程隔离（-Xmx 限内存）与容器隔离（JavaDockerCodeSandbox）——分层防御。
+     */
+    private static final List<String> BLACK_LIST = Arrays.asList(
+            // 执行系统命令 / 进程操作
+            "exec", "ProcessBuilder", "Runtime", "Process",
+            // 文件读写（含 NIO 与经典 IO 流）
+            "Files", "RandomAccessFile", "FileChannel", "MappedByteBuffer",
+            "FileInputStream", "FileOutputStream", "FileReader", "FileWriter",
+            // 网络访问
+            "Socket", "ServerSocket", "HttpClient", "URLConnection",
+            // 动态脚本引擎（可间接执行任意代码）
+            "ScriptEngine");
+
+    /**
+     * 黑名单字典树（不可变，仅在类加载时构建一次）
+     */
+    private static final WordTree BLACK_LIST_TREE;
+
+    static {
+        BLACK_LIST_TREE = new WordTree();
+        BLACK_LIST_TREE.addWords(BLACK_LIST);
+    }
+
+    private static final boolean IS_WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
+
+    /**
+     * 定位当前 JDK 的 bin 目录：JDK 8 的 java.home 指向内嵌 JRE（bin 下没有 javac），需回退到 JDK 根目录。
+     * 编译和运行固定用同一套 JDK 自带的 javac/java，不依赖 PATH——
+     * 否则本机装多个 JDK 时可能出现"javac 21 编译出 v65 字节码、java 8 运行报 UnsupportedClassVersionError"。
+     */
+    private static File resolveJdkBinDir() {
+        File home = new File(System.getProperty("java.home"));
+        if (!new File(home, "bin" + File.separator + "javac" + (IS_WINDOWS ? ".exe" : "")).exists()
+                && home.getName().equalsIgnoreCase("jre")) {
+            home = home.getParentFile();
+        }
+        return new File(home, "bin");
+    }
+
+    private static String getJavacExecutable() {
+        return new File(resolveJdkBinDir(), "javac" + (IS_WINDOWS ? ".exe" : "")).getAbsolutePath();
+    }
+
+    private static String getJavaExecutable() {
+        return new File(resolveJdkBinDir(), "java" + (IS_WINDOWS ? ".exe" : "")).getAbsolutePath();
+    }
+
     @Override
     public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest) {
         List<String> inputList = executeCodeRequest.getInputList();
         String code = executeCodeRequest.getCode();
         String language = executeCodeRequest.getLanguage();
+
+        // 0. 代码安全检查（E03）：命中危险关键字黑名单则直接拒绝，不进入编译执行流程
+        checkCodeSafety(code);
 
         // 1. 把用户的代码保存为文件
         File userCodeFile = saveCodeToFile(code);
@@ -56,6 +113,22 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
             log.error("deleteFile error, userCodeFilePath = {}", userCodeFile.getAbsolutePath());
         }
         return outputResponse;
+    }
+
+    /**
+     * 0. 代码安全检查：DFA 字典树匹配危险关键字黑名单
+     * 命中时抛出异常，由 MainController 统一转换为 status=2 的结构化错误响应，
+     * 判题服务据此将提交置为"危险操作"失败，而不会误入用例比对流程。
+     * 子类可重写本方法以追加更严格（或更宽松）的策略，模板骨架不受影响。
+     *
+     * @param code 用户提交的代码
+     */
+    protected void checkCodeSafety(String code) {
+        // matchAll：返回文本中命中的所有黑名单词
+        java.util.List<String> matched = BLACK_LIST_TREE.matchAll(code);
+        if (matched != null && !matched.isEmpty()) {
+            throw new RuntimeException("代码包含被禁止的关键字: " + matched);
+        }
     }
 
     /**
@@ -84,9 +157,10 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
      * @return 编译信息
      */
     public ExecuteMessage compileFile(File userCodeFile) {
-        String compileCmd = String.format("javac -encoding utf-8 %s", userCodeFile.getAbsolutePath());
         try {
-            Process compileProcess = Runtime.getRuntime().exec(compileCmd);
+            // 用参数列表而非拼接字符串，路径含空格也不会被拆断
+            Process compileProcess = new ProcessBuilder(getJavacExecutable(), "-encoding", "utf-8",
+                    userCodeFile.getAbsolutePath()).start();
             ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(compileProcess, "编译");
             if (executeMessage.getExitValue() != 0) {
                 throw new RuntimeException("编译错误");
@@ -109,21 +183,11 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
 
         List<ExecuteMessage> executeMessageList = new ArrayList<>();
         for (String inputArgs : inputList) {
-//            String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main %s", userCodeParentPath, inputArgs);
-            String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main %s", userCodeParentPath, inputArgs);
+            // 用例输入不拼进命令行，由 runInteractProcess 写入子进程的标准输入（OJ 代码用 Scanner(System.in) 读输入）
             try {
-                Process runProcess = Runtime.getRuntime().exec(runCmd);
-                // 超时控制
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(TIME_OUT);
-                        System.out.println("超时了，中断");
-                        runProcess.destroy();
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }).start();
-                ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(runProcess, "运行");
+                Process runProcess = new ProcessBuilder(getJavaExecutable(), "-Xmx256m", "-Dfile.encoding=UTF-8",
+                        "-cp", userCodeParentPath, "Main").start();
+                ExecuteMessage executeMessage = ProcessUtils.runInteractProcess(runProcess, inputArgs, TIME_OUT, "运行");
                 System.out.println(executeMessage);
                 executeMessageList.add(executeMessage);
             } catch (Exception e) {
