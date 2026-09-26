@@ -1,8 +1,10 @@
 server:
   port: 8090
 
-# 沙箱接口鉴权（E02）：与判题服务 RemoteCodeSandbox 的 SIGN_SECRET 保持一致
-# 生产环境应通过环境变量或配置中心覆盖默认值，避免密钥进入代码库
+# 沙箱实现切换：native=本机进程(默认) / docker=容器隔离(内存统计+c++/python)
 sandbox:
+  type: native
   auth:
+    # 与判题服务 RemoteCodeSandbox 的 SIGN_SECRET 保持一致
+    # 生产环境应通过环境变量或配置中心覆盖默认值，避免密钥进入代码库
     secretKey: secretKey

@@ -1,6 +1,7 @@
 package com.lian.lianojcodesandbox.controller;
 
 import cn.hutool.json.JSONUtil;
+import com.lian.lianojcodesandbox.JavaDockerCodeSandbox;
 import com.lian.lianojcodesandbox.JavaNativeCodeSandbox;
 import com.lian.lianojcodesandbox.model.ExecuteCodeRequest;
 import com.lian.lianojcodesandbox.model.ExecuteCodeResponse;
@@ -37,12 +38,30 @@ public class MainController {
     @Value("${sandbox.auth.secretKey:secretKey}")
     private String secretKey;
 
+    /**
+     * 沙箱实现切换开关（P1 审查补接线）：native=本机进程（默认，快、零依赖），
+     * docker=容器隔离（支持内存统计与 c++/python）。判题服务侧的 codesandbox.type
+     * 只决定"调不调远程沙箱"，本配置决定"远程沙箱用哪种实现"。
+     */
+    @Value("${sandbox.type:native}")
+    private String sandboxType;
+
     @Resource
     private JavaNativeCodeSandbox javaNativeCodeSandbox;
+
+    @Resource
+    private JavaDockerCodeSandbox javaDockerCodeSandbox;
 
     @GetMapping("/health")
     public String healthCheck() {
         return "ok";
+    }
+
+    /**
+     * 按配置选择沙箱实现
+     */
+    private com.lian.lianojcodesandbox.CodeSandbox resolveSandbox() {
+        return "docker".equals(sandboxType) ? javaDockerCodeSandbox : javaNativeCodeSandbox;
     }
 
     /**
@@ -81,7 +100,7 @@ public class MainController {
         // 3) 执行代码：任何内部异常都转为结构化错误响应（status=2），
         //    避免直接抛 500 导致判题服务只能拿到空响应而无法区分错误类型
         try {
-            return javaNativeCodeSandbox.executeCode(executeCodeRequest);
+            return resolveSandbox().executeCode(executeCodeRequest);
         } catch (Exception e) {
             log.error("沙箱执行异常: {}", e.getMessage(), e);
             return buildSandboxErrorResponse("沙箱内部错误: " + e.getMessage());

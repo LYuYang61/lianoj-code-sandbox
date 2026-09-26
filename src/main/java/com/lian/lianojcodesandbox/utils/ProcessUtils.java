@@ -110,7 +110,14 @@ public class ProcessUtils {
             if (!finished) {
                 System.out.println(opName + "超时了，中断");
                 runProcess.destroy();
-                runProcess.waitFor();  // 等待销毁完成，保证下面 exitValue() 可用
+                // destroy() 发送的是终止信号（Windows=kill / Linux=SIGTERM），
+                // 忽略信号或派生子进程的程序可能不退出——3 秒后强制升级为 kill -9
+                if (!runProcess.waitFor(3, TimeUnit.SECONDS)) {
+                    runProcess.destroyForcibly();
+                    runProcess.waitFor();
+                }
+                // 显式标记超时：整理阶段据此把响应置为 status=5（判题端判"超时"而非 WA）
+                executeMessage.setErrorMessage("Time Limit Exceeded（沙箱超时强制中断）");
             }
             int exitValue = runProcess.exitValue();  // 获取错误码
             executeMessage.setExitValue(exitValue);  // 设置退出值

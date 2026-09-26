@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### OJ sandbox runtime (判题临时目录与编译缓存，运行时生成不入库) ###
+tmpCode/

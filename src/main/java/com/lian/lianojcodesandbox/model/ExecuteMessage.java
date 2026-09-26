@@ -32,4 +32,10 @@ public class ExecuteMessage {
      * 进程执行内存
      */
     private Long memory;
+
+    /**
+     * 是否为编译失败（E09 语义区分）：编译错误与运行错误的处理路径不同——
+     * 判题服务把 status=4 置为"编译错误"，把运行错误的输出缺失按比对逻辑判 Wrong Answer
+     */
+    private Boolean compileError;
 }
