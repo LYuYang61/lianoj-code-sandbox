@@ -2,8 +2,14 @@ package com.lian.lianojcodesandbox.container;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.model.HostConfig;
-import com.github.dockerjava.core.DockerClientBuilder;
+import com.github.dockerjava.core.DefaultDockerClientConfig;
+import com.github.dockerjava.core.DockerClientConfig;
+import com.github.dockerjava.core.DockerClientImpl;
+import com.github.dockerjava.core.command.ExecStartResultCallback;
+import com.github.dockerjava.transport.DockerHttpClient;
+import com.github.dockerjava.zerodep.ZerodepDockerHttpClient;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -12,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 沙箱容器池（E11）：把"创建+启动容器"的数百毫秒开销从每次判题中移除
@@ -43,13 +50,26 @@ public class SandboxContainerPool {
     private final Map<String, LinkedBlockingDeque<String>> pools = new ConcurrentHashMap<>();
 
     /**
-     * 获取全局唯一的 Docker 客户端（懒加载；默认读环境变量 DOCKER_HOST）
+     * 获取全局唯一的 Docker 客户端（懒加载）
+     * <p>传输层显式使用 zerodep，而非 DockerClientBuilder 默认回退的 Jersey：
+     * 本机 Docker Desktop（WSL2 后端）的守护进程通过 Windows 命名管道暴露
+     * （docker context "desktop-linux" → npipe:////./pipe/dockerDesktopLinuxEngine，
+     * 由 docker-java 的 DockerContextMetaFile 在无 DOCKER_HOST 环境变量时解析），
+     * Jersey 不支持 npipe 协议（真机验证报 Unsupported protocol scheme），
+     * zerodep 的 NamedPipeSocket 原生支持。配置解析链路保持不变。
      */
     public DockerClient getDockerClient() {
         if (dockerClient == null) {
             synchronized (this) {
                 if (dockerClient == null) {
-                    dockerClient = DockerClientBuilder.getInstance().build();
+                    DockerClientConfig config =
+                            DefaultDockerClientConfig.createDefaultConfigBuilder().build();
+                    DockerHttpClient httpClient = new ZerodepDockerHttpClient.Builder()
+                            .dockerHost(config.getDockerHost())
+                            .sslConfig(config.getSSLConfig())
+                            .maxConnections(100)
+                            .build();
+                    dockerClient = DockerClientImpl.getInstance(config, httpClient);
                 }
             }
         }
@@ -58,6 +78,8 @@ public class SandboxContainerPool {
 
     /**
      * 借用一个已启动的容器：池空则即时创建（退化为非池化路径，行为一致）
+     * <p>R20 自愈：池内 ID 可能因外部清理（如手工 docker rm、Docker 重启）而失效——
+     * 借出前用 inspectCmd 校验容器存活，死 ID 直接丢弃并现场创建，判题不受影响。
      *
      * @param image 容器镜像（来自语言配置）
      * @return 容器 id
@@ -66,9 +88,15 @@ public class SandboxContainerPool {
         LinkedBlockingDeque<String> pool = pools.computeIfAbsent(image,
                 key -> new LinkedBlockingDeque<>());
         String containerId = pool.poll();
-        if (containerId != null) {
-            log.info("容器池命中: image={}, containerId={}", image, containerId);
-            return containerId;
+        while (containerId != null) {
+            try {
+                getDockerClient().inspectContainerCmd(containerId).exec();
+                log.info("容器池命中: image={}, containerId={}", image, containerId);
+                return containerId;
+            } catch (Exception e) {
+                log.warn("容器池中的容器已失效(外部删除?), 丢弃并取下一个: containerId={}", containerId);
+                containerId = pool.poll();
+            }
         }
         return createAndStart(image);
     }
@@ -121,8 +149,37 @@ public class SandboxContainerPool {
                 .withAttachStdin(true)
                 .withAttachStdout(true)
                 .withAttachStderr(true);
+        // 保活主进程（真机验证发现的缺陷）：三个判题镜像的默认 CMD 均为一次性命令
+        // （temurin entrypoint 脚本跑完即退 / bash、python3 无交互 stdin 即退），
+        // 容器会在启动后立刻停止——而本实现靠 exec 在容器内执行命令（exec 要求容器
+        // 处于 running 状态），池预热的"空容器"根本活不到被借用时刻。
+        containerCmd.withCmd("tail", "-f", "/dev/null");
         String containerId = containerCmd.exec().getId();
         client.startContainerCmd(containerId).exec();
+        // 预创建工作目录 /app：archive 提取 API（copyArchiveToContainer）与 docker cp 不同，
+        // 目标路径不存在会直接 404（Could not find the file /app）。
+        // 必须在"创建时"同步 exec mkdir 并等待完成——若推迟到借用时，按需创建的容器
+        // 存在"start 刚返回、mkdir 尚未执行"的竞态窗口（真机验证：C++ 判题 404）。
+        // 短命令同步 exec 在 npipe 传输上稳定可用（真机探针结论，见 P1 文档 §10）。
+        ExecCreateCmdResponse mkdir = client.execCreateCmd(containerId)
+                .withCmd("mkdir", "-p", "/app")
+                .withAttachStdout(true)
+                .withAttachStderr(true)
+                .exec();
+        boolean mkdirDone;
+        try {
+            mkdirDone = client.execStartCmd(mkdir.getId())
+                    .exec(new ExecStartResultCallback())
+                    .awaitCompletion(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            client.removeContainerCmd(containerId).withForce(true).exec();
+            throw new IllegalStateException("判题容器初始化被中断", e);
+        }
+        if (!mkdirDone) {
+            client.removeContainerCmd(containerId).withForce(true).exec();
+            throw new IllegalStateException("判题容器初始化超时（mkdir /app）");
+        }
         log.info("创建判题容器: image={}, containerId={}", image, containerId);
         return containerId;
     }

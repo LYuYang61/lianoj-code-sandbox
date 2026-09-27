@@ -53,6 +53,14 @@
             <artifactId>docker-java-transport-httpclient5</artifactId>
             <version>3.3.0</version>
         </dependency>
+        <!-- zerodep 传输层：Windows 下 Docker Desktop 经命名管道(npipe)暴露守护进程，
+             默认回退的 Jersey 不支持 npipe（真机验证报 Unsupported protocol scheme），
+             zerodep 内置 NamedPipeSocket 原生支持 -->
+        <dependency>
+            <groupId>com.github.docker-java</groupId>
+            <artifactId>docker-java-transport-zerodep</artifactId>
+            <version>3.3.0</version>
+        </dependency>
 
 
     </dependencies>

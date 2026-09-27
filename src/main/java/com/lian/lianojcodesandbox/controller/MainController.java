@@ -52,9 +52,29 @@ public class MainController {
     @Resource
     private JavaDockerCodeSandbox javaDockerCodeSandbox;
 
+    @Resource
+    private com.lian.lianojcodesandbox.container.SandboxContainerPool containerPool;
+
     @GetMapping("/health")
     public String healthCheck() {
         return "ok";
+    }
+
+    /**
+     * Docker 模式下预热 java 镜像容器（E11 容器池）：
+     * 启动时尝试预热 2 个容器，Docker 未就绪/镜像未拉取时仅告警不影响启动；
+     * 判题借用时池命中可省去 create+start 的数百毫秒开销。
+     */
+    @javax.annotation.PostConstruct
+    public void preWarmPool() {
+        if ("docker".equals(sandboxType)) {
+            try {
+                containerPool.preWarm("openjdk:8-alpine", 2);
+                log.info("沙箱容器池预热完成(java)");
+            } catch (Exception e) {
+                log.warn("沙箱容器池预热失败(判题时会即时创建): {}", e.getMessage());
+            }
+        }
     }
 
     /**
